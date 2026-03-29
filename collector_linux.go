@@ -45,145 +45,153 @@ func readCPUTemp() float64 {
 }
 
 // ─────────────────────────────────────────────
-// Linux GPU: NVIDIA (nvidia-smi) → AMD (sysfs) → Intel (sysfs)
+// Linux GPU: NVIDIA (nvidia-smi) + AMD (sysfs) + Intel (sysfs)
 // ─────────────────────────────────────────────
 
-func collectGPUPlatform() GPUMetrics {
-	// Try NVIDIA first
-	if m := collectNvidiaGPU(); m.Available {
-		return m
+func collectGPUPlatform() []GPUMetrics {
+	var gpus []GPUMetrics
+
+	// Collect NVIDIA
+	gpus = append(gpus, collectNvidiaGPUs()...)
+
+	// Collect AMD
+	gpus = append(gpus, collectAMDGPUs()...)
+
+	// Collect Intel integrated
+	if intel := collectIntelGPU(); intel.Available {
+		gpus = append(gpus, intel)
 	}
-	// Try AMD
-	if m := collectAMDGPU(); m.Available {
-		return m
-	}
-	// Try Intel integrated
-	if m := collectIntelGPU(); m.Available {
-		return m
-	}
-	return GPUMetrics{}
+
+	return gpus
 }
 
-func collectNvidiaGPU() GPUMetrics {
-	m := GPUMetrics{}
+func collectNvidiaGPUs() []GPUMetrics {
+	var gpus []GPUMetrics
 
 	out, err := exec.Command("nvidia-smi",
 		"--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu,fan.speed,power.draw,power.limit,driver_version",
 		"--format=csv,noheader,nounits").Output()
 	if err != nil {
-		return m
+		return gpus
 	}
 
-	m.Available = true
-	parts := strings.Split(strings.TrimSpace(string(out)), ", ")
-	if len(parts) >= 9 {
-		m.Name = strings.TrimSpace(parts[0])
-		if v, err := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 64); err == nil {
-			m.MemTotal = v * 1024 * 1024
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
 		}
-		if v, err := strconv.ParseUint(strings.TrimSpace(parts[2]), 10, 64); err == nil {
-			m.MemUsed = v * 1024 * 1024
+
+		m := GPUMetrics{Available: true}
+		parts := strings.Split(line, ", ")
+		if len(parts) >= 9 {
+			m.Name = strings.TrimSpace(parts[0])
+			if v, err := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 64); err == nil {
+				m.MemTotal = v * 1024 * 1024
+			}
+			if v, err := strconv.ParseUint(strings.TrimSpace(parts[2]), 10, 64); err == nil {
+				m.MemUsed = v * 1024 * 1024
+			}
+			if m.MemTotal > 0 {
+				m.MemPercent = float64(m.MemUsed) / float64(m.MemTotal) * 100
+			}
+			if v, err := strconv.ParseFloat(strings.TrimSpace(parts[3]), 64); err == nil {
+				m.Utilization = v
+			}
+			if v, err := strconv.ParseFloat(strings.TrimSpace(parts[4]), 64); err == nil {
+				m.Temperature = v
+			}
+			if v, err := strconv.ParseFloat(strings.TrimSpace(parts[5]), 64); err == nil {
+				m.FanSpeed = v
+			}
+			if v, err := strconv.ParseFloat(strings.TrimSpace(parts[6]), 64); err == nil {
+				m.PowerDraw = v
+			}
+			if v, err := strconv.ParseFloat(strings.TrimSpace(parts[7]), 64); err == nil {
+				m.PowerLimit = v
+			}
+			m.DriverVer = strings.TrimSpace(parts[8])
 		}
-		if m.MemTotal > 0 {
-			m.MemPercent = float64(m.MemUsed) / float64(m.MemTotal) * 100
-		}
-		if v, err := strconv.ParseFloat(strings.TrimSpace(parts[3]), 64); err == nil {
-			m.Utilization = v
-		}
-		if v, err := strconv.ParseFloat(strings.TrimSpace(parts[4]), 64); err == nil {
-			m.Temperature = v
-		}
-		if v, err := strconv.ParseFloat(strings.TrimSpace(parts[5]), 64); err == nil {
-			m.FanSpeed = v
-		}
-		if v, err := strconv.ParseFloat(strings.TrimSpace(parts[6]), 64); err == nil {
-			m.PowerDraw = v
-		}
-		if v, err := strconv.ParseFloat(strings.TrimSpace(parts[7]), 64); err == nil {
-			m.PowerLimit = v
-		}
-		m.DriverVer = strings.TrimSpace(parts[8])
+		gpus = append(gpus, m)
 	}
 
-	return m
+	return gpus
 }
 
-func collectAMDGPU() GPUMetrics {
-	m := GPUMetrics{}
+func collectAMDGPUs() []GPUMetrics {
+	var gpus []GPUMetrics
 
 	matches, _ := filepath.Glob("/sys/class/drm/card*/device/gpu_busy_percent")
-	if len(matches) == 0 {
-		return m
-	}
+	for _, match := range matches {
+		m := GPUMetrics{Available: true, Name: "AMD GPU"}
 
-	m.Available = true
-	m.Name = "AMD GPU"
-
-	// Try to get a better name from the device
-	devDir := filepath.Dir(filepath.Dir(matches[0]))
-	if nameData, err := os.ReadFile(filepath.Join(devDir, "device", "product_name")); err == nil {
-		m.Name = strings.TrimSpace(string(nameData))
-	}
-
-	// Utilization
-	if data, err := os.ReadFile(matches[0]); err == nil {
-		if v, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64); err == nil {
-			m.Utilization = v
+		// Try to get a better name from the device
+		devDir := filepath.Dir(filepath.Dir(match))
+		if nameData, err := os.ReadFile(filepath.Join(devDir, "device", "product_name")); err == nil {
+			m.Name = strings.TrimSpace(string(nameData))
 		}
-	}
 
-	// Temperature
-	tempPaths, _ := filepath.Glob(filepath.Join(devDir, "device", "hwmon", "hwmon*", "temp1_input"))
-	for _, p := range tempPaths {
-		if data, err := os.ReadFile(p); err == nil {
+		// Utilization
+		if data, err := os.ReadFile(match); err == nil {
 			if v, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64); err == nil {
-				m.Temperature = v / 1000.0
-				break
+				m.Utilization = v
 			}
 		}
-	}
 
-	// VRAM total
-	if data, err := os.ReadFile(filepath.Join(devDir, "device", "mem_info_vram_total")); err == nil {
-		if v, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64); err == nil {
-			m.MemTotal = v
-		}
-	}
-
-	// VRAM used
-	if data, err := os.ReadFile(filepath.Join(devDir, "device", "mem_info_vram_used")); err == nil {
-		if v, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64); err == nil {
-			m.MemUsed = v
-		}
-	}
-
-	if m.MemTotal > 0 && m.MemUsed > 0 {
-		m.MemPercent = float64(m.MemUsed) / float64(m.MemTotal) * 100
-	}
-
-	// Fan speed
-	fanPaths, _ := filepath.Glob(filepath.Join(devDir, "device", "hwmon", "hwmon*", "pwm1"))
-	for _, p := range fanPaths {
-		if data, err := os.ReadFile(p); err == nil {
-			if v, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64); err == nil {
-				m.FanSpeed = v / 255.0 * 100 // PWM 0-255 to percent
-				break
+		// Temperature
+		tempPaths, _ := filepath.Glob(filepath.Join(devDir, "device", "hwmon", "hwmon*", "temp1_input"))
+		for _, p := range tempPaths {
+			if data, err := os.ReadFile(p); err == nil {
+				if v, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64); err == nil {
+					m.Temperature = v / 1000.0
+					break
+				}
 			}
 		}
-	}
 
-	// Power draw (microwatts)
-	powerPaths, _ := filepath.Glob(filepath.Join(devDir, "device", "hwmon", "hwmon*", "power1_average"))
-	for _, p := range powerPaths {
-		if data, err := os.ReadFile(p); err == nil {
-			if v, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64); err == nil {
-				m.PowerDraw = v / 1000000.0 // µW to W
-				break
+		// VRAM total
+		if data, err := os.ReadFile(filepath.Join(devDir, "device", "mem_info_vram_total")); err == nil {
+			if v, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64); err == nil {
+				m.MemTotal = v
 			}
 		}
+
+		// VRAM used
+		if data, err := os.ReadFile(filepath.Join(devDir, "device", "mem_info_vram_used")); err == nil {
+			if v, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64); err == nil {
+				m.MemUsed = v
+			}
+		}
+
+		if m.MemTotal > 0 && m.MemUsed > 0 {
+			m.MemPercent = float64(m.MemUsed) / float64(m.MemTotal) * 100
+		}
+
+		// Fan speed
+		fanPaths, _ := filepath.Glob(filepath.Join(devDir, "device", "hwmon", "hwmon*", "pwm1"))
+		for _, p := range fanPaths {
+			if data, err := os.ReadFile(p); err == nil {
+				if v, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64); err == nil {
+					m.FanSpeed = v / 255.0 * 100 // PWM 0-255 to percent
+					break
+				}
+			}
+		}
+
+		// Power draw (microwatts)
+		powerPaths, _ := filepath.Glob(filepath.Join(devDir, "device", "hwmon", "hwmon*", "power1_average"))
+		for _, p := range powerPaths {
+			if data, err := os.ReadFile(p); err == nil {
+				if v, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64); err == nil {
+					m.PowerDraw = v / 1000000.0 // µW to W
+					break
+				}
+			}
+		}
+
+		gpus = append(gpus, m)
 	}
 
-	return m
+	return gpus
 }
 
 func collectIntelGPU() GPUMetrics {
