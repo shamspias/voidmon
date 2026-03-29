@@ -26,7 +26,7 @@ type SystemMetrics struct {
 	Disks     []DiskMetrics
 	IO        IOMetrics
 	Network   NetworkMetrics
-	GPU       GPUMetrics
+	GPUs      []GPUMetrics
 	Processes []ProcessInfo
 	Power     PowerMetrics
 	Host      HostInfo
@@ -158,7 +158,7 @@ func (c *Collector) Collect() SystemMetrics {
 		Disks:     c.collectDisks(),
 		IO:        c.collectIO(elapsed),
 		Network:   c.collectNetwork(elapsed),
-		GPU:       c.collectGPU(),
+		GPUs:      c.collectGPUs(),
 		Processes: c.collectProcesses(),
 		Power:     c.collectPower(),
 		Host:      c.collectHost(),
@@ -366,7 +366,7 @@ func (c *Collector) collectNetwork(elapsed float64) NetworkMetrics {
 // GPU Collection (platform-dispatched)
 // ─────────────────────────────────────────────
 
-func (c *Collector) collectGPU() GPUMetrics {
+func (c *Collector) collectGPUs() []GPUMetrics {
 	// collectGPUPlatform is in collector_linux.go / collector_darwin.go
 	return collectGPUPlatform()
 }
