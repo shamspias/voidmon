@@ -6,7 +6,9 @@ set -euo pipefail
 
 REPO="shamspias/voidmon"
 BIN_NAME="void"
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR="$HOME/.local/bin"
+
+mkdir -p "$INSTALL_DIR"
 
 # ─── Detect OS and arch ──────────────────────
 
