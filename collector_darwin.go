@@ -73,8 +73,8 @@ type spDisplayData struct {
 	} `json:"SPDisplaysDataType"`
 }
 
-func collectGPUPlatform() GPUMetrics {
-	m := GPUMetrics{}
+func collectGPUPlatform() []GPUMetrics {
+	var gpus []GPUMetrics
 
 	// ── Step 1: Get GPU identity from system_profiler ──
 	out, err := exec.Command("system_profiler", "SPDisplaysDataType", "-json").Output()
@@ -87,43 +87,47 @@ func collectGPUPlatform() GPUMetrics {
 		return collectGPUFallback()
 	}
 
-	gpu := data.SPDisplaysDataType[0]
-	m.Available = true
+	for _, gpu := range data.SPDisplaysDataType {
+		m := GPUMetrics{Available: true}
 
-	// Determine GPU name
-	if gpu.ChipType != "" {
-		m.Name = gpu.ChipType
-	} else if gpu.Name != "" {
-		m.Name = gpu.Name
-	} else {
-		m.Name = "Unknown GPU"
-	}
+		// Determine GPU name
+		if gpu.ChipType != "" {
+			m.Name = gpu.ChipType
+		} else if gpu.Name != "" {
+			m.Name = gpu.Name
+		} else {
+			m.Name = "Unknown GPU"
+		}
 
-	// Parse VRAM
-	vramStr := gpu.VRAM
-	if vramStr == "" {
-		vramStr = gpu.VRAMShared
-	}
-	if vramStr != "" {
-		m.MemTotal = parseVRAMString(vramStr)
-	}
+		// Parse VRAM
+		vramStr := gpu.VRAM
+		if vramStr == "" {
+			vramStr = gpu.VRAMShared
+		}
+		if vramStr != "" {
+			m.MemTotal = parseVRAMString(vramStr)
+		}
 
-	// Metal support as driver version
-	if gpu.MetalFamily != "" {
-		m.DriverVer = gpu.MetalFamily
+		// Metal support as driver version
+		if gpu.MetalFamily != "" {
+			m.DriverVer = gpu.MetalFamily
+		}
+
+		gpus = append(gpus, m)
 	}
 
 	// ── Step 2: Try to get live utilization ──
-
-	// Apple Silicon GPU usage via powermetrics (needs sudo -n / passwordless sudo)
-	if isAppleSilicon() {
-		m = collectAppleSiliconGPUMetrics(m)
+	if isAppleSilicon() && len(gpus) > 0 {
+		// powermetrics generally reports aggregate for the SoC
+		gpus[0] = collectAppleSiliconGPUMetrics(gpus[0])
 	} else {
-		// Intel Mac with discrete GPU — try ioreg
-		m = collectIntelMacGPUMetrics(m)
+		// Intel Mac with discrete GPU(s) — try ioreg
+		for i := range gpus {
+			gpus[i] = collectIntelMacGPUMetrics(gpus[i])
+		}
 	}
 
-	return m
+	return gpus
 }
 
 func isAppleSilicon() bool {
@@ -245,7 +249,8 @@ func collectIntelMacGPUMetrics(m GPUMetrics) GPUMetrics {
 	return m
 }
 
-func collectGPUFallback() GPUMetrics {
+func collectGPUFallback() []GPUMetrics {
+	var gpus []GPUMetrics
 	m := GPUMetrics{}
 
 	// Simple fallback: just get the chip name from sysctl on Apple Silicon
@@ -260,10 +265,11 @@ func collectGPUFallback() GPUMetrics {
 			} else {
 				m.Name = "Apple GPU"
 			}
+			gpus = append(gpus, m)
 		}
 	}
 
-	return m
+	return gpus
 }
 
 func parseVRAMString(s string) uint64 {
