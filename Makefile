@@ -55,8 +55,8 @@ build-all: build-linux-amd64 build-linux-arm64 build-darwin-arm64 build-darwin-a
 
 release: build-all
 	@mkdir -p $(BUILD_DIR)/release
-	@cd $(BUILD_DIR) && tar -czf release/$(BIN_NAME)-$(VERSION)-linux-amd64.tar.gz $(BIN_NAME)-linux-amd64
-	@cd $(BUILD_DIR) && tar -czf release/$(BIN_NAME)-$(VERSION)-linux-arm64.tar.gz $(BIN_NAME)-linux-arm64
-	@cd $(BUILD_DIR) && tar -czf release/$(BIN_NAME)-$(VERSION)-darwin-arm64.tar.gz $(BIN_NAME)-darwin-arm64
-	@cd $(BUILD_DIR) && tar -czf release/$(BIN_NAME)-$(VERSION)-darwin-amd64.tar.gz $(BIN_NAME)-darwin-amd64
+	@cd $(BUILD_DIR) && tar -czf release/$(BIN_NAME)-linux-amd64.tar.gz $(BIN_NAME)-linux-amd64
+	@cd $(BUILD_DIR) && tar -czf release/$(BIN_NAME)-linux-arm64.tar.gz $(BIN_NAME)-linux-arm64
+	@cd $(BUILD_DIR) && tar -czf release/$(BIN_NAME)-darwin-arm64.tar.gz $(BIN_NAME)-darwin-arm64
+	@cd $(BUILD_DIR) && tar -czf release/$(BIN_NAME)-darwin-amd64.tar.gz $(BIN_NAME)-darwin-amd64
 	@echo "  ✓ Release tarballs in $(BUILD_DIR)/release/"
