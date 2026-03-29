@@ -353,57 +353,69 @@ func (u *UI) renderNetwork() {
 
 func (u *UI) renderGPU() {
 	var b strings.Builder
-	g := u.metrics.GPU
+	gpus := u.metrics.GPUs
 
-	if !g.Available {
+	if len(gpus) == 0 {
 		fmt.Fprintf(&b, "\n  %sNo GPU detected%s\n", colorDim, colorReset)
 		fmt.Fprintf(&b, "  %sInstall nvidia-smi or check AMD sysfs%s", colorDim, colorReset)
 		u.gpuPanel.SetText(b.String())
 		return
 	}
 
-	// GPU Name
-	name := g.Name
-	if len(name) > 35 {
-		name = name[:32] + "..."
-	}
-	fmt.Fprintf(&b, " %s%s%s", colorWhite, name, colorReset)
-	if g.DriverVer != "" {
-		fmt.Fprintf(&b, " %s[%s]%s", colorDim, g.DriverVer, colorReset)
-	}
-	fmt.Fprintf(&b, "\n")
+	for i, g := range gpus {
+		if i > 0 {
+			// Add a small spacer between multiple GPUs
+			fmt.Fprintf(&b, "\n")
+		}
 
-	// Usage bar
-	fmt.Fprintf(&b, "  %sUsage%s  %s %s%5.1f%%%s\n",
-		colorSecondary, colorReset,
-		renderBar(g.Utilization, 20),
-		percentColor(g.Utilization), g.Utilization, colorReset)
+		// GPU Name
+		name := g.Name
+		if len(gpus) > 1 {
+			// Prepend index if multiple GPUs exist
+			name = fmt.Sprintf("[%d] %s", i, name)
+		}
 
-	// VRAM bar
-	if g.MemTotal > 0 {
-		fmt.Fprintf(&b, "  %sVRAM %s  %s %s%5.1f%%%s\n",
-			colorAccent, colorReset,
-			renderBar(g.MemPercent, 20),
-			percentColor(g.MemPercent), g.MemPercent, colorReset)
-		fmt.Fprintf(&b, "         %s%s / %s%s\n",
-			colorDim, FormatBytes(g.MemUsed), FormatBytes(g.MemTotal), colorReset)
-	}
+		if len(name) > 35 {
+			name = name[:32] + "..."
+		}
+		fmt.Fprintf(&b, " %s%s%s", colorWhite, name, colorReset)
+		if g.DriverVer != "" {
+			fmt.Fprintf(&b, " %s[%s]%s", colorDim, g.DriverVer, colorReset)
+		}
+		fmt.Fprintf(&b, "\n")
 
-	// Temperature, Fan, Power
-	var info []string
-	if g.Temperature > 0 {
-		info = append(info, fmt.Sprintf("%sTemp:%s %s%.0f°C%s",
-			colorDim, colorReset, tempColor(g.Temperature), g.Temperature, colorReset))
-	}
-	if g.FanSpeed > 0 {
-		info = append(info, fmt.Sprintf("%sFan:%s %.0f%%", colorDim, colorReset, g.FanSpeed))
-	}
-	if g.PowerDraw > 0 {
-		info = append(info, fmt.Sprintf("%sPwr:%s %.0fW/%.0fW",
-			colorDim, colorReset, g.PowerDraw, g.PowerLimit))
-	}
-	if len(info) > 0 {
-		fmt.Fprintf(&b, "  %s", strings.Join(info, "  "))
+		// Usage bar
+		fmt.Fprintf(&b, "  %sUsage%s  %s %s%5.1f%%%s\n",
+			colorSecondary, colorReset,
+			renderBar(g.Utilization, 20),
+			percentColor(g.Utilization), g.Utilization, colorReset)
+
+		// VRAM bar
+		if g.MemTotal > 0 {
+			fmt.Fprintf(&b, "  %sVRAM %s  %s %s%5.1f%%%s\n",
+				colorAccent, colorReset,
+				renderBar(g.MemPercent, 20),
+				percentColor(g.MemPercent), g.MemPercent, colorReset)
+			fmt.Fprintf(&b, "         %s%s / %s%s\n",
+				colorDim, FormatBytes(g.MemUsed), FormatBytes(g.MemTotal), colorReset)
+		}
+
+		// Temperature, Fan, Power
+		var info []string
+		if g.Temperature > 0 {
+			info = append(info, fmt.Sprintf("%sTemp:%s %s%.0f°C%s",
+				colorDim, colorReset, tempColor(g.Temperature), g.Temperature, colorReset))
+		}
+		if g.FanSpeed > 0 {
+			info = append(info, fmt.Sprintf("%sFan:%s %.0f%%", colorDim, colorReset, g.FanSpeed))
+		}
+		if g.PowerDraw > 0 {
+			info = append(info, fmt.Sprintf("%sPwr:%s %.0fW/%.0fW",
+				colorDim, colorReset, g.PowerDraw, g.PowerLimit))
+		}
+		if len(info) > 0 {
+			fmt.Fprintf(&b, "  %s\n", strings.Join(info, "  "))
+		}
 	}
 
 	u.gpuPanel.SetText(b.String())
