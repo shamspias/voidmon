@@ -369,3 +369,13 @@ func collectPowerPlatform() PowerMetrics {
 
 	return m
 }
+
+// ─────────────────────────────────────────────
+// macOS Process GPU Collection
+// ─────────────────────────────────────────────
+
+func collectProcessGPU() map[int32]uint64 {
+	// macOS does not easily expose per-process GPU metrics via standard CLI tools
+	// without root/private frameworks, so we return an empty map.
+	return make(map[int32]uint64)
+}
