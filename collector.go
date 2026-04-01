@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -103,9 +104,11 @@ type ProcessInfo struct {
 	Name   string
 	CPUPct float64
 	MemPct float32
+	RSS    uint64
+	GPUMem uint64
+	Port   string
 	Status string
 	User   string
-	RSS    uint64
 }
 
 type PowerMetrics struct {
@@ -169,35 +172,29 @@ func (c *Collector) Collect() SystemMetrics {
 	return m
 }
 
-// ─────────────────────────────────────────────
-// CPU Collection
-// ─────────────────────────────────────────────
+// ... Keep collectCPU(), collectMemory(), collectDisks(), collectIO(), collectNetwork(), collectGPUs() the same as before ...
 
 func (c *Collector) collectCPU() CPUMetrics {
 	m := CPUMetrics{
 		Threads: runtime.NumCPU(),
 	}
 
-	// Per-core usage
 	perCore, err := cpu.Percent(0, true)
 	if err == nil {
 		m.PerCore = perCore
 	}
 
-	// Overall usage
 	overall, err := cpu.Percent(0, false)
 	if err == nil && len(overall) > 0 {
 		m.Overall = overall[0]
 	}
 
-	// CPU info
 	infos, err := cpu.Info()
 	if err == nil && len(infos) > 0 {
 		m.ModelName = infos[0].ModelName
 		m.Frequency = infos[0].Mhz
 	}
 
-	// Load average
 	loadAvg, err := load.Avg()
 	if err == nil {
 		m.LoadAvg1 = loadAvg.Load1
@@ -205,17 +202,10 @@ func (c *Collector) collectCPU() CPUMetrics {
 		m.LoadAvg15 = loadAvg.Load15
 	}
 
-	// CPU temperature
 	m.Temperature = readCPUTemp()
 
 	return m
 }
-
-// readCPUTemp is implemented in collector_linux.go / collector_darwin.go
-
-// ─────────────────────────────────────────────
-// Memory Collection
-// ─────────────────────────────────────────────
 
 func (c *Collector) collectMemory() MemoryMetrics {
 	m := MemoryMetrics{}
@@ -240,10 +230,6 @@ func (c *Collector) collectMemory() MemoryMetrics {
 	return m
 }
 
-// ─────────────────────────────────────────────
-// Disk Collection
-// ─────────────────────────────────────────────
-
 func (c *Collector) collectDisks() []DiskMetrics {
 	var disks []DiskMetrics
 
@@ -254,7 +240,6 @@ func (c *Collector) collectDisks() []DiskMetrics {
 
 	seen := make(map[string]bool)
 	for _, p := range partitions {
-		// Skip pseudo/virtual filesystems
 		if strings.HasPrefix(p.Mountpoint, "/snap") ||
 			strings.HasPrefix(p.Mountpoint, "/boot/efi") ||
 			p.Fstype == "squashfs" || p.Fstype == "tmpfs" ||
@@ -283,22 +268,16 @@ func (c *Collector) collectDisks() []DiskMetrics {
 		})
 	}
 
-	// Sort by mountpoint
 	sort.Slice(disks, func(i, j int) bool {
 		return disks[i].MountPoint < disks[j].MountPoint
 	})
 
-	// Limit to 6 entries max for display
 	if len(disks) > 6 {
 		disks = disks[:6]
 	}
 
 	return disks
 }
-
-// ─────────────────────────────────────────────
-// I/O Collection
-// ─────────────────────────────────────────────
 
 func (c *Collector) collectIO(elapsed float64) IOMetrics {
 	m := IOMetrics{}
@@ -336,10 +315,6 @@ func (c *Collector) collectIO(elapsed float64) IOMetrics {
 	return m
 }
 
-// ─────────────────────────────────────────────
-// Network Collection
-// ─────────────────────────────────────────────
-
 func (c *Collector) collectNetwork(elapsed float64) NetworkMetrics {
 	m := NetworkMetrics{}
 
@@ -362,16 +337,9 @@ func (c *Collector) collectNetwork(elapsed float64) NetworkMetrics {
 	return m
 }
 
-// ─────────────────────────────────────────────
-// GPU Collection (platform-dispatched)
-// ─────────────────────────────────────────────
-
 func (c *Collector) collectGPUs() []GPUMetrics {
-	// collectGPUPlatform is in collector_linux.go / collector_darwin.go
 	return collectGPUPlatform()
 }
-
-// collectGPUPlatform is implemented in collector_linux.go / collector_darwin.go
 
 // ─────────────────────────────────────────────
 // Process Collection
@@ -380,6 +348,28 @@ func (c *Collector) collectGPUs() []GPUMetrics {
 func (c *Collector) collectProcesses() []ProcessInfo {
 	var procs []ProcessInfo
 
+	// 1. Map listening network ports to PIDs
+	portMap := make(map[int32]string)
+	conns, err := net.Connections("inet")
+	if err == nil {
+		for _, conn := range conns {
+			if conn.Status == "LISTEN" && conn.Pid > 0 {
+				portStr := strconv.Itoa(int(conn.Laddr.Port))
+				if existing, ok := portMap[conn.Pid]; ok {
+					if !strings.Contains(existing, portStr) {
+						portMap[conn.Pid] = existing + "," + portStr
+					}
+				} else {
+					portMap[conn.Pid] = portStr
+				}
+			}
+		}
+	}
+
+	// 2. Map GPU memory to PIDs
+	gpuMemMap := collectProcessGPU()
+
+	// 3. Collect standard process details
 	pids, err := process.Processes()
 	if err != nil {
 		return procs
@@ -427,9 +417,11 @@ func (c *Collector) collectProcesses() []ProcessInfo {
 			Name:   name,
 			CPUPct: cpuPct,
 			MemPct: memPct,
+			RSS:    rss,
+			GPUMem: gpuMemMap[p.Pid],
+			Port:   portMap[p.Pid],
 			Status: statusStr,
 			User:   user,
-			RSS:    rss,
 		})
 	}
 
@@ -447,19 +439,12 @@ func (c *Collector) collectProcesses() []ProcessInfo {
 }
 
 // ─────────────────────────────────────────────
-// Power Collection (platform-dispatched)
+// Power and Host Collection
 // ─────────────────────────────────────────────
 
 func (c *Collector) collectPower() PowerMetrics {
-	// collectPowerPlatform is in collector_linux.go / collector_darwin.go
 	return collectPowerPlatform()
 }
-
-// collectPowerPlatform is implemented in collector_linux.go / collector_darwin.go
-
-// ─────────────────────────────────────────────
-// Host Collection
-// ─────────────────────────────────────────────
 
 func (c *Collector) collectHost() HostInfo {
 	h := HostInfo{
