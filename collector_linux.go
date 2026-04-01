@@ -303,3 +303,32 @@ func collectPowerPlatform() PowerMetrics {
 
 	return m
 }
+
+// ─────────────────────────────────────────────
+// Linux Process GPU Collection (NVIDIA)
+// ─────────────────────────────────────────────
+
+func collectProcessGPU() map[int32]uint64 {
+	m := make(map[int32]uint64)
+
+	// Fast lookup of used memory by PID via nvidia-smi
+	out, err := exec.Command("nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits").Output()
+	if err == nil {
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		for _, line := range lines {
+			if line == "" {
+				continue
+			}
+			parts := strings.Split(line, ", ")
+			if len(parts) == 2 {
+				if pid, err := strconv.ParseInt(parts[0], 10, 32); err == nil {
+					if memMiB, err := strconv.ParseUint(parts[1], 10, 64); err == nil {
+						m[int32(pid)] = memMiB * 1024 * 1024 // MiB to Bytes
+					}
+				}
+			}
+		}
+	}
+
+	return m
+}
