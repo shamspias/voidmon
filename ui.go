@@ -467,18 +467,18 @@ func (u *UI) renderProcesses() {
 	procs := u.metrics.Processes
 
 	// Header
-	fmt.Fprintf(&b, " %s%s  %-7s  %-20s  %7s  %7s  %8s  %-10s  %-10s%s\n",
+	fmt.Fprintf(&b, " %s%s  %-7s  %-18s  %7s  %-16s  %-10s  %-14s  %-8s  %-10s%s\n",
 		colorSecondary, colorBold,
-		"PID", "NAME", "CPU%", "MEM%", "RSS", "STATUS", "USER",
+		"PID", "NAME", "CPU%", "RAM", "GPU MEM", "PORT(S)", "STATUS", "USER",
 		colorReset)
 
 	// Separator
-	fmt.Fprintf(&b, " %s%s%s\n", colorMuted, strings.Repeat("─", 82), colorReset)
+	fmt.Fprintf(&b, " %s%s%s\n", colorMuted, strings.Repeat("─", 102), colorReset)
 
 	for _, p := range procs {
 		name := p.Name
-		if len(name) > 20 {
-			name = name[:17] + "..."
+		if len(name) > 18 {
+			name = name[:15] + "..."
 		}
 		user := p.User
 		if len(user) > 10 {
@@ -500,12 +500,30 @@ func (u *UI) renderProcesses() {
 			statusColor = colorCritical
 		}
 
-		fmt.Fprintf(&b, "   %-7d  %s%-20s%s  %s%7.1f%s  %7.1f  %8s  %s%-10s%s  %-10s\n",
+		// Format RAM nicely: " 5.2% (120M) "
+		ramStr := fmt.Sprintf("%5.1f%% (%s)", p.MemPct, FormatBytes(p.RSS))
+
+		// Format GPU Memory
+		gpuStr := "-"
+		if p.GPUMem > 0 {
+			gpuStr = FormatBytes(p.GPUMem)
+		}
+
+		// Format Ports
+		portStr := p.Port
+		if portStr == "" {
+			portStr = "-"
+		} else if len(portStr) > 14 {
+			portStr = portStr[:11] + "..."
+		}
+
+		fmt.Fprintf(&b, "   %-7d  %s%-18s%s  %s%7.1f%s  %-16s  %-10s  %-14s  %s%-8s%s  %-10s\n",
 			p.PID,
 			colorPrimary, name, colorReset,
 			cpuColor, p.CPUPct, colorReset,
-			p.MemPct,
-			FormatBytes(p.RSS),
+			ramStr,
+			gpuStr,
+			portStr,
 			statusColor, p.Status, colorReset,
 			user,
 		)
