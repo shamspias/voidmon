@@ -1,6 +1,6 @@
 APP_NAME := voidmon
 BIN_NAME := void
-VERSION := 1.0.0
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 BUILD_DIR := build
 GOFLAGS := -ldflags="-s -w -X main.version=$(VERSION)"
 

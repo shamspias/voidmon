@@ -118,6 +118,9 @@ void -r 5s       # 5 seconds
 
 # Version info:
 void -v
+
+# Check for updates and upgrade:
+void -u
 ```
 
 ## Keybindings
@@ -155,6 +158,7 @@ Install `osx-cpu-temp` for CPU temperature readings:
 ```bash
 brew install osx-cpu-temp
 ```
+
 ---
 
 ## Building Releases
