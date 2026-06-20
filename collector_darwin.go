@@ -4,55 +4,134 @@ package main
 
 import (
 	"encoding/json"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
+
+// ─────────────────────────────────────────────
+// powermetrics — sampled once per tick, shared by CPU temp / GPU / power.
+//
+// powermetrics requires sudo. We probe once; if passwordless sudo is not
+// available we cache the negative and never spawn it again. When it IS
+// available we run a SINGLE invocation per refresh (smc + gpu_power) and the
+// three collectors read from the cached parse instead of shelling out 3x.
+// ─────────────────────────────────────────────
+
+type pmSample struct {
+	cpuTemp  float64
+	gpuUtil  float64
+	gpuPower float64 // watts
+	sysPower float64 // watts
+	taken    time.Time
+	valid    bool
+}
+
+var (
+	pmMu        sync.Mutex
+	pmLast      pmSample
+	pmAvailable = true
+	pmNextProbe time.Time // earliest time to re-probe after a failure
+)
+
+func powermetricsSample() pmSample {
+	pmMu.Lock()
+	defer pmMu.Unlock()
+
+	// Reuse within a single refresh (the three callers run microseconds apart).
+	// The TTL must NOT survive into the next tick (refresh floor is 500ms), so
+	// keep it small.
+	if pmLast.valid && time.Since(pmLast.taken) < 100*time.Millisecond {
+		return pmLast
+	}
+	// After a failure, back off instead of latching forever: a transient
+	// timeout (busy box) or briefly-uncached sudo must not disable these metrics
+	// for the whole session, and the fast `sudo -n` denial is cheap to retry.
+	if !pmAvailable && time.Now().Before(pmNextProbe) {
+		return pmSample{}
+	}
+
+	out, err := cmdOutput(3*time.Second, "sudo", "-n", "powermetrics",
+		"--samplers", "smc,gpu_power", "-i", "200", "-n", "1")
+	if err != nil {
+		pmAvailable = false
+		pmNextProbe = time.Now().Add(30 * time.Second)
+		return pmSample{}
+	}
+	pmAvailable = true
+
+	s := pmSample{taken: time.Now(), valid: true}
+	// powermetrics formats every metric as "Label: <number> <unit>", so we read
+	// the first number AFTER the colon — robust to cluster indices in the label
+	// (e.g. "GPU 0 Power:" must not yield 0).
+	reVal := regexp.MustCompile(`:\s*([\d.]+)`)
+	val := func(lower string) (float64, bool) {
+		if m := reVal.FindStringSubmatch(lower); len(m) > 1 {
+			if v, err := strconv.ParseFloat(m[1], 64); err == nil {
+				return v, true
+			}
+		}
+		return 0, false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		lower := strings.ToLower(line)
+		switch {
+		case strings.Contains(lower, "cpu die temperature") || strings.Contains(lower, "cpu proximity"):
+			if v, ok := val(lower); ok {
+				s.cpuTemp = v
+			}
+		// The real line is "GPU HW active residency: NN.NN%".
+		case strings.Contains(lower, "gpu") && strings.Contains(lower, "active residency"):
+			if v, ok := val(lower); ok {
+				s.gpuUtil = v
+			}
+		case strings.Contains(lower, "gpu power"):
+			if v, ok := val(lower); ok {
+				s.gpuPower = mwToW(v, lower)
+			}
+		case strings.Contains(lower, "combined power") || strings.Contains(lower, "system power"):
+			if v, ok := val(lower); ok {
+				s.sysPower = mwToW(v, lower)
+			}
+		}
+	}
+
+	pmLast = s
+	return s
+}
+
+func mwToW(v float64, lower string) float64 {
+	if strings.Contains(lower, "mw") {
+		return v / 1000.0
+	}
+	return v
+}
 
 // ─────────────────────────────────────────────
 // macOS CPU Temperature
 // ─────────────────────────────────────────────
 
 func readCPUTemp() float64 {
-	// Method 1: osx-cpu-temp (if installed via brew)
-	if out, err := exec.Command("osx-cpu-temp", "-c").Output(); err == nil {
-		s := strings.TrimSpace(string(out))
-		s = strings.TrimSuffix(s, "°C")
-		s = strings.TrimSpace(s)
-		if v, err := strconv.ParseFloat(s, 64); err == nil {
+	// osx-cpu-temp (brew) — fast, no sudo.
+	if out, err := cmdOutput(2*time.Second, "osx-cpu-temp", "-c"); err == nil {
+		s := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(string(out)), "°C"))
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v > 0 {
 			return v
 		}
 	}
 
-	// Method 2: Parse from powermetrics (requires sudo, best-effort)
-	if out, err := exec.Command("sudo", "-n", "powermetrics",
-		"--samplers", "smc", "-i", "500", "-n", "1").Output(); err == nil {
-		lines := strings.Split(string(out), "\n")
-		for _, line := range lines {
-			lower := strings.ToLower(line)
-			if strings.Contains(lower, "cpu die temperature") ||
-				strings.Contains(lower, "cpu proximity") {
-				re := regexp.MustCompile(`([\d.]+)\s*°?C`)
-				if m := re.FindStringSubmatch(line); len(m) > 1 {
-					if v, err := strconv.ParseFloat(m[1], 64); err == nil {
-						return v
-					}
-				}
-			}
-		}
-	}
-
-	// Method 3: istats gem (if installed)
-	if out, err := exec.Command("istats", "cpu", "temp", "--value-only").Output(); err == nil {
-		s := strings.TrimSpace(string(out))
-		s = strings.TrimSuffix(s, "°C")
-		if v, err := strconv.ParseFloat(strings.TrimSpace(s), 64); err == nil {
+	// istats gem (if installed).
+	if out, err := cmdOutput(2*time.Second, "istats", "cpu", "temp", "--value-only"); err == nil {
+		s := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(string(out)), "°C"))
+		if v, err := strconv.ParseFloat(s, 64); err == nil && v > 0 {
 			return v
 		}
 	}
 
-	return 0
+	// Last resort: powermetrics (needs passwordless sudo; probed once).
+	return powermetricsSample().cpuTemp
 }
 
 // ─────────────────────────────────────────────
@@ -73,33 +152,46 @@ type spDisplayData struct {
 	} `json:"SPDisplaysDataType"`
 }
 
-func collectGPUPlatform() []GPUMetrics {
-	var gpus []GPUMetrics
+var (
+	gpuIdentityMu   sync.Mutex
+	gpuIdentity     []GPUMetrics
+	gpuIdentityDone bool
+	appleSiliconVal bool
+	appleSiliconHas bool
+	appleSiliconMu  sync.Mutex
+)
 
-	// ── Step 1: Get GPU identity from system_profiler ──
-	out, err := exec.Command("system_profiler", "SPDisplaysDataType", "-json").Output()
+// gpuIdentityCached runs the (relatively heavy) system_profiler probe and caches
+// the GPU identity — names/VRAM/Metal don't change at runtime. A transient
+// failure is NOT cached (we return a best-effort fallback and retry next tick),
+// so a busy-startup hiccup can't blank the GPU panel for the whole session.
+func gpuIdentityCached() []GPUMetrics {
+	gpuIdentityMu.Lock()
+	defer gpuIdentityMu.Unlock()
+	if gpuIdentityDone {
+		return gpuIdentity
+	}
+
+	out, err := cmdOutput(5*time.Second, "system_profiler", "SPDisplaysDataType", "-json")
 	if err != nil {
 		return collectGPUFallback()
 	}
-
 	var data spDisplayData
 	if err := json.Unmarshal(out, &data); err != nil || len(data.SPDisplaysDataType) == 0 {
 		return collectGPUFallback()
 	}
 
+	var ids []GPUMetrics
 	for _, gpu := range data.SPDisplaysDataType {
 		m := GPUMetrics{Available: true}
-
-		// Determine GPU name
-		if gpu.ChipType != "" {
+		switch {
+		case gpu.ChipType != "":
 			m.Name = gpu.ChipType
-		} else if gpu.Name != "" {
+		case gpu.Name != "":
 			m.Name = gpu.Name
-		} else {
+		default:
 			m.Name = "Unknown GPU"
 		}
-
-		// Parse VRAM
 		vramStr := gpu.VRAM
 		if vramStr == "" {
 			vramStr = gpu.VRAMShared
@@ -107,21 +199,33 @@ func collectGPUPlatform() []GPUMetrics {
 		if vramStr != "" {
 			m.MemTotal = parseVRAMString(vramStr)
 		}
-
-		// Metal support as driver version
 		if gpu.MetalFamily != "" {
 			m.DriverVer = gpu.MetalFamily
 		}
-
-		gpus = append(gpus, m)
+		ids = append(ids, m)
 	}
 
-	// ── Step 2: Try to get live utilization ──
-	if isAppleSilicon() && len(gpus) > 0 {
-		// powermetrics generally reports aggregate for the SoC
-		gpus[0] = collectAppleSiliconGPUMetrics(gpus[0])
+	gpuIdentity = ids
+	gpuIdentityDone = true
+	return gpuIdentity
+}
+
+func collectGPUPlatform() []GPUMetrics {
+	identity := gpuIdentityCached()
+	if len(identity) == 0 {
+		return nil
+	}
+
+	// Copy so live metrics don't mutate the cached identity.
+	gpus := make([]GPUMetrics, len(identity))
+	copy(gpus, identity)
+
+	if isAppleSilicon() {
+		// powermetrics reports aggregate GPU stats for the SoC.
+		s := powermetricsSample()
+		gpus[0].Utilization = s.gpuUtil
+		gpus[0].PowerDraw = s.gpuPower
 	} else {
-		// Intel Mac with discrete GPU(s) — try ioreg
 		for i := range gpus {
 			gpus[i] = collectIntelMacGPUMetrics(gpus[i])
 		}
@@ -131,79 +235,32 @@ func collectGPUPlatform() []GPUMetrics {
 }
 
 func isAppleSilicon() bool {
-	out, err := exec.Command("sysctl", "-n", "machdep.cpu.brand_string").Output()
-	if err != nil {
-		// Fallback: check arch
-		out2, err2 := exec.Command("uname", "-m").Output()
-		if err2 == nil && strings.TrimSpace(string(out2)) == "arm64" {
-			return true
-		}
-		return false
+	appleSiliconMu.Lock()
+	defer appleSiliconMu.Unlock()
+	if appleSiliconHas {
+		return appleSiliconVal
 	}
-	brand := strings.ToLower(strings.TrimSpace(string(out)))
-	return strings.Contains(brand, "apple")
-}
+	appleSiliconHas = true
 
-func collectAppleSiliconGPUMetrics(m GPUMetrics) GPUMetrics {
-	// powermetrics gives GPU usage on Apple Silicon (requires sudo)
-	out, err := exec.Command("sudo", "-n", "powermetrics",
-		"--samplers", "gpu_power", "-i", "500", "-n", "1").Output()
-	if err != nil {
-		return m
+	if out, err := cmdOutput(2*time.Second, "sysctl", "-n", "machdep.cpu.brand_string"); err == nil {
+		appleSiliconVal = strings.Contains(strings.ToLower(strings.TrimSpace(string(out))), "apple")
+		return appleSiliconVal
 	}
-
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		lower := strings.ToLower(line)
-
-		// GPU active residency = utilization
-		if strings.Contains(lower, "gpu active residency") {
-			re := regexp.MustCompile(`([\d.]+)\s*%`)
-			if match := re.FindStringSubmatch(line); len(match) > 1 {
-				if v, err := strconv.ParseFloat(match[1], 64); err == nil {
-					m.Utilization = v
-				}
-			}
-		}
-
-		// GPU power
-		if strings.Contains(lower, "gpu power") && strings.Contains(lower, "mw") {
-			re := regexp.MustCompile(`([\d.]+)\s*mW`)
-			if match := re.FindStringSubmatch(line); len(match) > 1 {
-				if v, err := strconv.ParseFloat(match[1], 64); err == nil {
-					m.PowerDraw = v / 1000.0 // mW to W
-				}
-			}
-		}
-
-		// GPU frequency
-		if strings.Contains(lower, "gpu hw active frequency") || strings.Contains(lower, "gpu active frequency") {
-			re := regexp.MustCompile(`([\d.]+)\s*mhz`)
-			if match := re.FindStringSubmatch(strings.ToLower(line)); len(match) > 1 {
-				// Store frequency info as fan speed field (reuse, no fan on MacBook)
-				if v, err := strconv.ParseFloat(match[1], 64); err == nil {
-					_ = v // Could display this somewhere
-				}
-			}
-		}
+	if out, err := cmdOutput(2*time.Second, "uname", "-m"); err == nil {
+		appleSiliconVal = strings.TrimSpace(string(out)) == "arm64"
 	}
-
-	return m
+	return appleSiliconVal
 }
 
 func collectIntelMacGPUMetrics(m GPUMetrics) GPUMetrics {
-	// For Intel Macs with AMD discrete GPU, try ioreg
-	out, err := exec.Command("ioreg", "-rc", "IOAccelerator").Output()
+	out, err := cmdOutput(3*time.Second, "ioreg", "-rc", "IOAccelerator")
 	if err != nil {
 		return m
 	}
 
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		// Look for GPU utilization percentage
-		if strings.Contains(line, "PerformanceStatistics") ||
-			strings.Contains(line, "GPU Core Utilization") ||
-			strings.Contains(line, "Device Utilization") {
+	reInt := regexp.MustCompile(`=\s*(\d+)`)
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, "GPU Core Utilization") || strings.Contains(line, "Device Utilization") {
 			re := regexp.MustCompile(`"?(?:GPU Core Utilization|Device Utilization %)"?\s*=\s*(\d+)`)
 			if match := re.FindStringSubmatch(line); len(match) > 1 {
 				if v, err := strconv.ParseFloat(match[1], 64); err == nil {
@@ -212,24 +269,26 @@ func collectIntelMacGPUMetrics(m GPUMetrics) GPUMetrics {
 			}
 		}
 
-		// VRAM usage
+		// VRAM total is reported in MB.
 		if strings.Contains(line, "VRAM,totalMB") {
-			re := regexp.MustCompile(`=\s*(\d+)`)
-			if match := re.FindStringSubmatch(line); len(match) > 1 {
+			if match := reInt.FindStringSubmatch(line); len(match) > 1 {
 				if v, err := strconv.ParseUint(match[1], 10, 64); err == nil {
 					m.MemTotal = v * 1024 * 1024
 				}
 			}
 		}
-		if strings.Contains(line, "VRAM,usedMB") || strings.Contains(line, "vramUsedBytes") {
-			re := regexp.MustCompile(`=\s*(\d+)`)
-			if match := re.FindStringSubmatch(line); len(match) > 1 {
+		// Used VRAM: handle the two keys with their correct units — never guess
+		// from magnitude.
+		if strings.Contains(line, "VRAM,usedMB") {
+			if match := reInt.FindStringSubmatch(line); len(match) > 1 {
 				if v, err := strconv.ParseUint(match[1], 10, 64); err == nil {
-					if v < 1024*1024 {
-						m.MemUsed = v * 1024 * 1024 // MB
-					} else {
-						m.MemUsed = v // already bytes
-					}
+					m.MemUsed = v * 1024 * 1024
+				}
+			}
+		} else if strings.Contains(line, "vramUsedBytes") {
+			if match := reInt.FindStringSubmatch(line); len(match) > 1 {
+				if v, err := strconv.ParseUint(match[1], 10, 64); err == nil {
+					m.MemUsed = v
 				}
 			}
 		}
@@ -237,13 +296,9 @@ func collectIntelMacGPUMetrics(m GPUMetrics) GPUMetrics {
 
 	if m.MemTotal > 0 && m.MemUsed > 0 {
 		m.MemPercent = float64(m.MemUsed) / float64(m.MemTotal) * 100
-	}
-
-	// Temperature from ioreg
-	out2, err := exec.Command("ioreg", "-rc", "AppleSMC").Output()
-	if err == nil {
-		// Best-effort GPU temp from SMC
-		_ = out2
+		if m.MemPercent > 100 {
+			m.MemPercent = 100
+		}
 	}
 
 	return m
@@ -251,19 +306,13 @@ func collectIntelMacGPUMetrics(m GPUMetrics) GPUMetrics {
 
 func collectGPUFallback() []GPUMetrics {
 	var gpus []GPUMetrics
-	m := GPUMetrics{}
 
-	// Simple fallback: just get the chip name from sysctl on Apple Silicon
-	out, err := exec.Command("sysctl", "-n", "machdep.cpu.brand_string").Output()
-	if err == nil {
+	if out, err := cmdOutput(2*time.Second, "sysctl", "-n", "machdep.cpu.brand_string"); err == nil {
 		brand := strings.TrimSpace(string(out))
 		if strings.Contains(strings.ToLower(brand), "apple") {
-			m.Available = true
-			// Derive GPU name from chip
-			if out2, err := exec.Command("sysctl", "-n", "hw.model").Output(); err == nil {
+			m := GPUMetrics{Available: true, Name: "Apple GPU"}
+			if out2, err := cmdOutput(2*time.Second, "sysctl", "-n", "hw.model"); err == nil {
 				m.Name = "Apple GPU (" + strings.TrimSpace(string(out2)) + ")"
-			} else {
-				m.Name = "Apple GPU"
 			}
 			gpus = append(gpus, m)
 		}
@@ -273,18 +322,15 @@ func collectGPUFallback() []GPUMetrics {
 }
 
 func parseVRAMString(s string) uint64 {
-	s = strings.TrimSpace(s)
 	re := regexp.MustCompile(`(\d+)\s*(MB|GB|TB)`)
-	match := re.FindStringSubmatch(strings.ToUpper(s))
+	match := re.FindStringSubmatch(strings.ToUpper(strings.TrimSpace(s)))
 	if len(match) < 3 {
 		return 0
 	}
-
 	val, err := strconv.ParseUint(match[1], 10, 64)
 	if err != nil {
 		return 0
 	}
-
 	switch match[2] {
 	case "TB":
 		return val * 1024 * 1024 * 1024 * 1024
@@ -297,13 +343,13 @@ func parseVRAMString(s string) uint64 {
 }
 
 // ─────────────────────────────────────────────
-// macOS Power via pmset
+// macOS Power via pmset (+ optional powermetrics for live watts)
 // ─────────────────────────────────────────────
 
 func collectPowerPlatform() PowerMetrics {
 	m := PowerMetrics{}
 
-	out, err := exec.Command("pmset", "-g", "batt").Output()
+	out, err := cmdOutput(2*time.Second, "pmset", "-g", "batt")
 	if err != nil {
 		return m
 	}
@@ -311,60 +357,39 @@ func collectPowerPlatform() PowerMetrics {
 	output := string(out)
 	m.Available = true
 
-	// Check AC or battery
 	if strings.Contains(output, "AC Power") {
 		m.OnAC = true
 	}
 
-	// Parse battery percentage
-	re := regexp.MustCompile(`(\d+)%`)
-	if match := re.FindStringSubmatch(output); len(match) > 1 {
+	if match := regexp.MustCompile(`(\d+)%`).FindStringSubmatch(output); len(match) > 1 {
 		if v, err := strconv.ParseFloat(match[1], 64); err == nil {
 			m.BatteryPct = v
 		}
 	}
 
-	// Parse status
-	if strings.Contains(output, "charging") && !strings.Contains(output, "not charging") {
+	switch {
+	case strings.Contains(output, "charging") && !strings.Contains(output, "not charging"):
 		m.Status = "Charging"
-	} else if strings.Contains(output, "discharging") {
+	case strings.Contains(output, "discharging"):
 		m.Status = "Discharging"
-	} else if strings.Contains(output, "charged") || strings.Contains(output, "finishing charge") {
+	case strings.Contains(output, "charged") || strings.Contains(output, "finishing charge"):
 		m.Status = "Full"
-	} else if strings.Contains(output, "not charging") {
+	case strings.Contains(output, "not charging"):
 		m.Status = "Not Charging"
 		m.OnAC = true
-	} else if m.OnAC {
+	case m.OnAC:
 		m.Status = "AC Power"
-	} else {
+	default:
 		m.Status = "Unknown"
 	}
 
-	// Time remaining
-	reTime := regexp.MustCompile(`(\d+:\d+)\s+remaining`)
-	if match := reTime.FindStringSubmatch(output); len(match) > 1 {
+	if match := regexp.MustCompile(`(\d+:\d+)\s+remaining`).FindStringSubmatch(output); len(match) > 1 {
 		m.TimeRemain = match[1]
 	}
 
-	// Power draw via powermetrics (best effort)
-	if out2, err := exec.Command("sudo", "-n", "powermetrics",
-		"--samplers", "battery", "-i", "500", "-n", "1").Output(); err == nil {
-		lines := strings.Split(string(out2), "\n")
-		for _, line := range lines {
-			lower := strings.ToLower(line)
-			if strings.Contains(lower, "combined power") || strings.Contains(lower, "system power") {
-				re := regexp.MustCompile(`([\d.]+)\s*(?:mW|W)`)
-				if match := re.FindStringSubmatch(line); len(match) > 1 {
-					if v, err := strconv.ParseFloat(match[1], 64); err == nil {
-						if strings.Contains(lower, "mw") {
-							m.PowerRate = v / 1000.0
-						} else {
-							m.PowerRate = v
-						}
-					}
-				}
-			}
-		}
+	// Live system power draw (watts), if powermetrics is available.
+	if p := powermetricsSample().sysPower; p > 0 {
+		m.PowerRate = p
 	}
 
 	return m
@@ -375,7 +400,7 @@ func collectPowerPlatform() PowerMetrics {
 // ─────────────────────────────────────────────
 
 func collectProcessGPU() map[int32]uint64 {
-	// macOS does not easily expose per-process GPU metrics via standard CLI tools
-	// without root/private frameworks, so we return an empty map.
+	// macOS does not expose per-process GPU memory via standard CLI tools
+	// without root/private frameworks.
 	return make(map[int32]uint64)
 }
