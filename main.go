@@ -7,36 +7,59 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 )
 
 const appName = "voidmon"
 
-// version is now a var instead of const so it can be overwritten at build time
+// version is a var (not const) so it can be overwritten at build time via
+// -ldflags "-X main.version=...".
 var version = "dev"
 
-// GitHubRelease is used to parse the latest release from the GitHub API
+// GitHubRelease parses the latest release from the GitHub API.
 type GitHubRelease struct {
 	TagName string `json:"tag_name"`
 }
 
 func main() {
-	// Flags
-	refreshRate := flag.Duration("r", 2*time.Second, "refresh rate (e.g., 1s, 2s, 5s)")
+	cfg := LoadConfig()
+
+	refreshRate := flag.Duration("r", cfg.Refresh, "refresh rate (e.g., 1s, 2s, 500ms)")
 	showVersion := flag.Bool("v", false, "show version")
-	updateApp := flag.Bool("u", false, "check for updates and upgrade to the latest version")
+	updateApp := flag.Bool("u", false, "check for updates and upgrade")
+	jsonOut := flag.Bool("json", false, "print metrics as JSON and exit (headless, no TUI)")
+	watch := flag.Bool("watch", false, "with -json: stream one JSON object per refresh (NDJSON)")
+	theme := flag.String("theme", cfg.Theme, "color theme: "+strings.Join(themeNames(), ", "))
+	noColor := flag.Bool("no-color", cfg.NoColor, "disable colors (also honors NO_COLOR env)")
+	icons := flag.Bool("icons", cfg.Icons, "use emoji icons in panel titles (use -icons=false to disable)")
 	flag.Parse()
+
+	// Flags override config / defaults.
+	cfg.Refresh = *refreshRate
+	if cfg.Refresh < 500*time.Millisecond {
+		cfg.Refresh = 500 * time.Millisecond
+	}
+	cfg.Theme = *theme
+	cfg.NoColor = *noColor
+	cfg.Icons = *icons
+
+	// NO_COLOR convention: its mere presence disables color, overriding any
+	// config-file `no_color=false` or the flag's inherited default.
+	if os.Getenv("NO_COLOR") != "" {
+		cfg.NoColor = true
+	}
 
 	if *showVersion {
 		printBanner()
-		fmt.Printf("  %s v%s\n", appName, version)
+		fmt.Printf("  %s %s\n", appName, displayVersion())
+		fmt.Printf("  %s/%s · Go %s\n", runtime.GOOS, runtime.GOARCH, runtime.Version())
 		fmt.Println("  Terminal system monitor with hacker aesthetics")
 		fmt.Println("  https://github.com/shamspias/voidmon")
 		os.Exit(0)
 	}
 
-	// Handle self-updating
 	if *updateApp {
 		if err := performUpdate(); err != nil {
 			fmt.Fprintf(os.Stderr, "\033[31m[voidmon] update failed: %v\033[0m\n", err)
@@ -45,23 +68,75 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Minimum refresh rate
-	if *refreshRate < 500*time.Millisecond {
-		*refreshRate = 500 * time.Millisecond
+	// Headless: a one-shot JSON snapshot or an NDJSON stream. Reuses the exact
+	// same Collect() the TUI uses — voidmon doubles as a scriptable exporter.
+	if *jsonOut {
+		runHeadless(cfg, *watch)
+		return
 	}
 
-	// Launch the UI
-	ui := NewUI(*refreshRate)
+	cfg.Theme = applyTheme(cfg.Theme, cfg.NoColor)
+
+	ui := NewUI(cfg)
 	if err := ui.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "\033[31m[voidmon] fatal: %v\033[0m\n", err)
 		os.Exit(1)
 	}
 }
 
+// runHeadless prints metrics without a TUI. It primes the collector once (so
+// IO/network/CPU deltas are real), waits one interval, then emits.
+func runHeadless(cfg Config, watch bool) {
+	c := NewCollector()
+	c.Collect() // prime deltas
+
+	warmup := cfg.Refresh
+	if warmup > time.Second {
+		warmup = time.Second
+	}
+	time.Sleep(warmup)
+
+	enc := json.NewEncoder(os.Stdout)
+
+	if !watch {
+		m := c.Collect()
+		m.Processes = capProcesses(m.Processes, cfg.ProcessCount)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(m)
+		return
+	}
+
+	// NDJSON: one compact object per line, forever (Ctrl-C to stop).
+	for {
+		m := c.Collect()
+		m.Processes = capProcesses(m.Processes, cfg.ProcessCount)
+		_ = enc.Encode(m)
+		time.Sleep(cfg.Refresh)
+	}
+}
+
+func capProcesses(p []ProcessInfo, n int) []ProcessInfo {
+	if n > 0 && len(p) > n {
+		return p[:n]
+	}
+	return p
+}
+
+func displayVersion() string {
+	v := version
+	if v == "" {
+		v = "dev"
+	}
+	if v != "dev" && !strings.HasPrefix(v, "v") {
+		v = "v" + v
+	}
+	return v
+}
+
 func printBanner() {
 	banner := `
   ┌──────────────────────────────────────────┐
-  │  ░▒▓█  V O I D M O N  █▓▒░             │
+  │  ░▒▓█  V O I D M O N  █▓▒░               │
   │  ─────────────────────────────           │
   │  System Monitor · Terminal Edition       │
   └──────────────────────────────────────────┘
@@ -70,7 +145,7 @@ func printBanner() {
 }
 
 func performUpdate() error {
-	fmt.Printf("  Current version: %s\n", version)
+	fmt.Printf("  Current version: %s\n", displayVersion())
 	fmt.Println("  → Checking latest release on GitHub...")
 
 	client := http.Client{Timeout: 10 * time.Second}
@@ -89,17 +164,25 @@ func performUpdate() error {
 		return fmt.Errorf("failed to parse GitHub response: %v", err)
 	}
 
-	// Strip the "v" prefix from the tag (e.g., "v1.0.1" -> "1.0.1")
-	latestVersion := strings.TrimPrefix(release.TagName, "v")
-	if latestVersion == version {
+	latest := strings.TrimPrefix(release.TagName, "v")
+	// Normalize the build-injected version (e.g. "v1.0.1-3-gabc-dirty") down to
+	// its base tag so the comparison can actually match.
+	cur := strings.SplitN(strings.TrimPrefix(version, "v"), "-", 2)[0]
+	if cur != "" && cur == latest {
 		fmt.Println("  ✓ You are already using the latest version!")
 		return nil
 	}
 
-	fmt.Printf("  → New version available: %s. Upgrading...\n\n", latestVersion)
+	fmt.Printf("  → New version available: %s. Upgrading...\n\n", latest)
 
-	// Run the existing install script to perform the update
-	cmd := exec.Command("bash", "-c", "curl -fsSL https://raw.githubusercontent.com/shamspias/voidmon/main/install.sh | bash")
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("powershell", "-NoProfile", "-Command",
+			"irm https://raw.githubusercontent.com/shamspias/voidmon/main/install.ps1 | iex")
+	} else {
+		cmd = exec.Command("bash", "-c",
+			"curl -fsSL https://raw.githubusercontent.com/shamspias/voidmon/main/install.sh | bash")
+	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
